@@ -1,4 +1,6 @@
 """Bounded declarative predicates; no expression evaluation or user SQL."""
+import hashlib
+import json
 from datetime import datetime, timezone
 
 
@@ -16,19 +18,206 @@ def active(spec, at):
         not spec.get("until") or at < timestamp(spec["until"]))
 
 
+def _canonical(document):
+    return json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _json_content(value, what):
+    """Return a canonical JSON round-trip of value, rejecting non-content."""
+    try:
+        return json.loads(_canonical(value))
+    except (TypeError, ValueError):
+        raise ValueError(f"operator {what} must be JSON-serializable content") from None
+
+
+def _code_content(code):
+    """Content digest payload for a code object: bytecode, constants, names.
+
+    Never includes object addresses; nested code objects are folded in
+    recursively so behaviour-affecting content is fully covered.
+    """
+    return {
+        "bytecode": code.co_code.hex(),
+        "consts": [_const_content(const) for const in code.co_consts],
+        "names": list(code.co_names),
+    }
+
+
+def _const_content(const):
+    if const is None or isinstance(const, (bool, int, float, str)):
+        return _json_content(const, "constant")
+    if isinstance(const, bytes):
+        return {"bytes": const.hex()}
+    if isinstance(const, tuple):
+        return {"tuple": [_const_content(c) for c in const]}
+    if isinstance(const, frozenset):
+        return {"frozenset": sorted((_const_content(c) for c in const), key=_canonical)}
+    if hasattr(const, "co_code"):
+        return {"code": _code_content(const)}
+    raise ValueError(f"operator constant {const!r} is not digestible content")
+
+
+def function_content(function):
+    """Content payload of an operator function: bytecode, constants, default
+    values and closure-captured state (which must be JSON content).
+
+    Raises ValueError for callables whose content cannot be pinned; hashing
+    object identities or version labels instead would not identify behaviour.
+    """
+    code = getattr(function, "__code__", None)
+    if code is None:
+        raise ValueError("operators must be introspectable Python functions")
+    closure = function.__closure__ or ()
+    return {
+        "code": _code_content(code),
+        "defaults": _json_content(function.__defaults__, "default values"),
+        "kwdefaults": _json_content(function.__kwdefaults__, "keyword defaults"),
+        "closure": [_json_content(cell.cell_contents, "captured state") for cell in closure],
+    }
+
+
+class OperatorSpec:
+    """A controlled operator release: name, version, config and content digest."""
+
+    def __init__(self, name, function, version, config=None):
+        if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
+            raise ValueError("operator name and version must be nonempty strings")
+        self.name, self.version = name, version
+        self.function = function
+        self.config = _json_content(config or {}, "config")
+        self.digest = hashlib.sha256(_canonical({
+            "version": self.version,
+            "config": self.config,
+            "function": function_content(function),
+        }).encode()).hexdigest()
+
+
+class OperatorRegistry:
+    """Controlled operator versions. A released (name, version) is immutable:
+    re-registering it with different content is rejected, so a caller cannot
+    silently change what an already reviewed identity resolves to."""
+
+    def __init__(self):
+        self._library = {}
+        self._current = {}
+
+    def register(self, name, function, version, config=None):
+        spec = OperatorSpec(name, function, version, config)
+        existing = self._library.get((name, version))
+        if existing is not None and existing.digest != spec.digest:
+            raise ValueError(f"operator {name}@{version} is released with different content; choose a new version")
+        self._library[(name, version)] = spec
+        self._current[name] = spec
+        return spec
+
+    def resolve(self, name, version):
+        return self._library.get((name, version))
+
+    def spec_for_function(self, name, function):
+        for spec in self._library.values():
+            if spec.name == name and spec.function is function:
+                return spec
+        return None
+
+    def current(self):
+        return dict(self._current)
+
+    @classmethod
+    def builtins(cls):
+        registry = cls()
+        for name, function in _BUILTINS.items():
+            registry.register(name, function, version="builtin/1")
+        return registry
+
+
+def _op_eq(a, b):
+    return a == b
+
+
+def _op_ne(a, b):
+    return a != b
+
+
+def _op_in(a, b):
+    return a in b
+
+
+def _op_contains(a, b):
+    return b in a
+
+
+def _op_gte(a, b):
+    return a >= b
+
+
+def _op_lt(a, b):
+    return a < b
+
+
+def _op_prefix(a, b):
+    return isinstance(a, str) and a.startswith(b)
+
+
+_BUILTINS = {
+    "eq": _op_eq, "ne": _op_ne, "in": _op_in, "contains": _op_contains,
+    "gte": _op_gte, "lt": _op_lt, "prefix": _op_prefix,
+}
+
+
 class PredicateEngine:
-    def __init__(self, operators=None, max_nodes=100, max_depth=12):
-        self.operators = {
-            "eq": lambda a, b: a == b,
-            "ne": lambda a, b: a != b,
-            "in": lambda a, b: a in b,
-            "contains": lambda a, b: b in a,
-            "gte": lambda a, b: a >= b,
-            "lt": lambda a, b: a < b,
-            "prefix": lambda a, b: isinstance(a, str) and a.startswith(b),
-            **(operators or {}),
-        }
+    # Rule interpretation protocol: node shapes, boolean semantics, leaf
+    # resolution and reason codes. Bumped when interpretation changes; an
+    # artifact pins the protocol it was reviewed under.
+    PROTOCOL = "taxonforge.predicate/1"
+
+    def __init__(self, operators=None, registry=None, max_nodes=100, max_depth=12):
+        self.registry = registry if registry is not None else OperatorRegistry.builtins()
+        for name, function in (operators or {}).items():
+            self.registry.register(name, function, version="1")
+        self._operators = None  # None: derive live from the registry
         self.max_nodes, self.max_depth = max_nodes, max_depth
+
+    @property
+    def operators(self):
+        # Live engines follow the registry, so a caller publishing a new
+        # controlled operator version changes what NEW drafts will run — and
+        # therefore produces a new artifact identity. Artifacts never use this
+        # live view: they execute on a frozen snapshot instead.
+        if self._operators is not None:
+            return self._operators
+        return {name: spec.function for name, spec in self.registry.current().items()}
+
+    @operators.setter
+    def operators(self, functions):
+        self._operators = dict(functions)
+
+    def operator_descriptor(self):
+        """Canonical {name: {version, config, digest}} for the operators this
+        engine would execute right now, pinning content rather than identity."""
+        if hasattr(self, "_descriptor"):
+            return self._descriptor
+        descriptor = {}
+        for name in sorted(self.operators):
+            spec = self.registry.spec_for_function(name, self.operators[name])
+            if spec is not None:
+                descriptor[name] = {"version": spec.version, "config": spec.config, "digest": spec.digest}
+            else:
+                descriptor[name] = {
+                    "version": "uncontrolled",
+                    "config": {},
+                    "digest": OperatorSpec(name, self.operators[name], "uncontrolled").digest,
+                }
+        return descriptor
+
+    def snapshot(self):
+        """Frozen copy for an artifact: later mutation of this engine or its
+        registry by the caller cannot leak into the snapshot."""
+        clone = object.__new__(type(self))
+        clone.registry = self.registry
+        clone._operators = dict(self.operators)
+        clone.max_nodes, clone.max_depth = self.max_nodes, self.max_depth
+        clone._descriptor = self.operator_descriptor()
+        return clone
 
     def validate(self, expression):
         nodes = 0
