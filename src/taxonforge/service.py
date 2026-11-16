@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import uuid
+from .mentions import AliasIndex, MentionAnnotator
 from .rules import PredicateEngine
 from .taxonomy import Taxonomy, canonical
 
@@ -64,6 +65,28 @@ class TaxonomyService:
         row = self.db.execute("SELECT records FROM runs WHERE id=?", (run_id,)).fetchone()
         if not row: raise KeyError("unknown run")
         return self.classify(json.loads(row[0]), version)
+
+    def annotate_mentions(self, chunks, version=None, **kwargs):
+        """Annotate term mentions against one explicit read-only version.
+
+        ``chunks`` is a one-time iterable of string chunks; cuts may fall at
+        any codepoint. This path never runs rules, evaluates predicates,
+        changes the active-version pointer, or persists anything: mentions
+        are not classification results and no category is selected.
+        """
+        if version is None:
+            active = self.db.execute("SELECT digest FROM active").fetchone()
+            if not active:
+                raise ValueError("no active taxonomy")
+            version = active[0]
+        # load() re-validates the stored document and fails loudly on an
+        # unknown digest; no rule is evaluated and nothing is persisted here.
+        taxonomy = self.load(version)
+        annotator = MentionAnnotator.from_index(
+            AliasIndex.from_taxonomy(taxonomy), **kwargs)
+        for chunk in chunks:
+            annotator.add(chunk)
+        return annotator.finish()
 
     def impact(self, records, before, after):
         left, right = self.load(before), self.load(after)
