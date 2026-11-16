@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "taxonforge"
+version = "0.1.0"
+description = "Temporal taxonomy rules, historical replay and impact analysis"
+requires-python = ">=3.11"
+dependencies = []
+[project.scripts]
+taxonforge = "taxonforge.cli:main"
+[tool.setuptools.packages.find]
+where = ["src"]
